@@ -263,7 +263,7 @@ def _search_features(
     }
 
     # STAC search endpoint is publicly accessible and does not require authentication
-    response = requests.post(STAC_SEARCH_URL, headers={"Content-Type": "application/json"}, json=payload, timeout=60)
+    response = requests.post(STAC_SEARCH_URL, headers={"Content-Type": "application/json"}, json=payload, timeout=300)
     if response.status_code != 200:
         raise CopernicusAPIError(
             "Copernicus STAC search failed with status "

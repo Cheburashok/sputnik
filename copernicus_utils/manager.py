@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import logging
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -24,6 +26,7 @@ from .copernicus_api import (
     fetch_latest_image_for_bbox,
 )
 from .image_processing import extract_tci_from_safe
+from .jp_processing import crop_tci_to_bbox, tif_to_png
 
 
 @dataclass(slots=True)
@@ -108,6 +111,7 @@ class MonumentImageManager:
         monument: Monument,
         start_date: dt.date | dt.datetime,
         end_date: dt.date | dt.datetime,
+        interval: Optional[int] = None,
     ) -> List[Path]:
         """Fetch all high-quality images for a monument within a date range.
 
@@ -127,6 +131,10 @@ class MonumentImageManager:
             Start date of the period (inclusive).
         end_date:
             End date of the period (inclusive).
+        interval:
+            Minimum number of days between downloaded images. If None, all images
+            are downloaded. If specified, only images that are at least 'interval'
+            days apart from the previous downloaded image will be included.
 
         Returns
         -------
@@ -152,6 +160,7 @@ class MonumentImageManager:
         metadata_dir.mkdir(parents=True, exist_ok=True)
 
         stored_paths: List[Path] = []
+        last_downloaded_date: Optional[dt.datetime] = None
 
         try:
             # Use generator to stream downloads one at a time
@@ -172,11 +181,32 @@ class MonumentImageManager:
                     image_path = images_dir / f"{base}{item['extension']}"
                     metadata_path = metadata_dir / f"{base}.json"
 
+                    # Parse image timestamp
+                    timestamp_str = item["metadata"].get("timestamp")
+                    if timestamp_str:
+                        # Parse ISO8601 timestamp
+                        image_date = dt.datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    else:
+                        image_date = None
+
                     # Skip if already downloaded
                     if metadata_path.exists():
                         logger.info(f"  Skipping {item['index']}/{item['total']}: already exists")
                         stored_paths.append(image_path)
+                        # Update last downloaded date if we have this image
+                        if image_date:
+                            last_downloaded_date = image_date
                         continue
+
+                    # Apply interval filter if specified
+                    if interval is not None and last_downloaded_date is not None and image_date is not None:
+                        days_since_last = (image_date - last_downloaded_date).days
+                        if days_since_last < interval:
+                            logger.info(
+                                f"  Skipping {item['index']}/{item['total']}: "
+                                f"only {days_since_last} days since last image (interval={interval})"
+                            )
+                            continue
 
                     # Get fresh token
                     token = _read_token(item["token_path"])
@@ -193,7 +223,59 @@ class MonumentImageManager:
                         image_path.write_bytes(content)
                     else:
                         # PRODUCT is large (800MB+), stream to disk
-                        _download_asset_to_file(item["href"], token, image_path)
+                        # Download to temp file, extract TCI, crop, convert to PNG
+                        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
+                            tmp_path = Path(tmp_file.name)
+
+                        try:
+                            # Download SAFE archive to temp file
+                            _download_asset_to_file(item["href"], token, tmp_path)
+
+                            # Find and extract TCI_10m.jp2 from SAFE archive
+                            tci_jp2_path = None
+                            with zipfile.ZipFile(tmp_path, 'r') as zf:
+                                for name in zf.namelist():
+                                    # Look for TCI file (10m resolution)
+                                    if "_TCI_10m.jp2" in name or "_TCI.jp2" in name:
+                                        tci_jp2_path = name
+                                        break
+
+                                if not tci_jp2_path:
+                                    raise FileNotFoundError("TCI file not found in SAFE archive")
+
+                                # Extract TCI to temporary location
+                                with tempfile.TemporaryDirectory() as extract_dir:
+                                    extract_path = Path(extract_dir)
+                                    tci_extracted = extract_path / Path(tci_jp2_path).name
+
+                                    # Extract the TCI file
+                                    with zf.open(tci_jp2_path) as source:
+                                        tci_extracted.write_bytes(source.read())
+
+                                    # Crop TCI to monument bbox
+                                    cropped_tif = extract_path / "cropped.tif"
+                                    crop_tci_to_bbox(
+                                        str(tci_extracted),
+                                        monument.bbox,
+                                        str(cropped_tif),
+                                        overviews=False  # Don't need overviews for PNG conversion
+                                    )
+
+                                    # Convert cropped TIF to PNG
+                                    png_path = images_dir / f"{base}.png"
+                                    tif_to_png(
+                                        str(cropped_tif),
+                                        str(png_path),
+                                        normalize=True
+                                    )
+
+                                    # Update image_path to point to PNG
+                                    image_path = png_path
+
+                        finally:
+                            # Clean up temporary SAFE archive
+                            if tmp_path.exists():
+                                tmp_path.unlink()
 
                     # Save metadata
                     import json
@@ -203,6 +285,10 @@ class MonumentImageManager:
                     )
 
                     stored_paths.append(image_path)
+
+                    # Update last downloaded date for interval tracking
+                    if image_date:
+                        last_downloaded_date = image_date
 
                 except Exception as e:
                     logger.warning(
@@ -223,6 +309,7 @@ class MonumentImageManager:
         self,
         start_date: dt.date | dt.datetime,
         end_date: dt.date | dt.datetime,
+        interval: Optional[int] = None,
     ) -> dict[str, List[Path]]:
         """Fetch all high-quality images for all monuments within a date range.
 
@@ -232,6 +319,10 @@ class MonumentImageManager:
             Start date of the period (inclusive).
         end_date:
             End date of the period (inclusive).
+        interval:
+            Minimum number of days between downloaded images. If None, all images
+            are downloaded. If specified, only images that are at least 'interval'
+            days apart from the previous downloaded image will be included.
 
         Returns
         -------
@@ -242,7 +333,7 @@ class MonumentImageManager:
 
         for monument in self.monuments:
             paths = self.collect_time_series_for_monument(
-                monument, start_date, end_date
+                monument, start_date, end_date, interval
             )
             results[monument.name] = paths
 
@@ -398,13 +489,13 @@ def demo_collect_all(
         lookback_days=lookback_days,
         max_cloud_cover=max_cloud_cover,
         token_path=token_path,
-        collection="SENTINEL-3",
-        asset_type="QUICKLOOK"
+        collection=collection,
+        asset_type="PRODUCT",
     )
     return manager.collect_time_series_for_all_monuments(
-        start_date=dt.date(2024, 6, 1),
-        end_date=dt.date(2025, 10, 10),
-
+        start_date=dt.date(2020, 7, 1),
+        end_date=dt.date(2022, 7, 1),
+        interval=30
     )
 
 

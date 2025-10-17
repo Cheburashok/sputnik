@@ -17,7 +17,7 @@ def extract_tci_from_safe(
     output_path: Path,
     *,
     max_size_mb: float = 10.0,
-    quality: int = 85,
+    quality: int = 100,
 ) -> Path:
     """Extract TCI (True Color Image) from SAFE archive and convert to PNG.
 
