@@ -467,3 +467,13 @@ See LICENSE file for details.
 - **Copernicus Data Space Ecosystem** - Satellite data provider
 - **Sentinel-2** - ESA's high-resolution Earth observation mission
 - **Landsat-7** - NASA/USGS Earth observation satellite
+
+## Satellite Analysis API
+
+The `analysis` package bundles ready-to-use tools for satellite imagery. A FastAPI application provides an endpoint that generates binary road segmentation masks using the pretrained [`valeo/segformer-b0-finetuned-cityscapes-1024-1024`](https://huggingface.co/valeo/segformer-b0-finetuned-cityscapes-1024-1024) model.
+
+```bash
+uvicorn analysis.api:app --reload
+```
+
+Send an RGB image via `multipart/form-data` to `/road-segmentation`. The service responds with a PNG mask where road pixels are white (`255`) and everything else is black (`0`).
