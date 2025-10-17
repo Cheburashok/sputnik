@@ -39,5 +39,5 @@ def get_copernicus_token(creds_path: str = ".credentials.yaml") -> str:
 if __name__ == "__main__":
     token = get_copernicus_token()
     print(token)
-    with open('copernicus_token.txt', 'w') as f:
+    with open('.copernicus_token.txt', 'w') as f:
         f.write(token)
