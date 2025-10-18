@@ -503,7 +503,7 @@ def demo_collect_all(
     max_cloud_cover: float = 100.0,
     token_path: Optional[Path] = None,
     collection: Collection = "SENTINEL-2",
-    n_cpu: int = 10,
+    n_cpu: int = 4,
 ) -> dict[str, List[Path]]:
     """Collect imagery for all monuments across a date range using parallel processing.
 
@@ -539,10 +539,11 @@ def demo_collect_all(
     end_dt = dt.datetime.fromisoformat(end_date).replace(tzinfo=dt.timezone.utc)
 
     # Determine search order based on date comparison
-    if start_dt > end_dt:
+    reverse_order = start_dt > end_dt
+    if reverse_order:
         order = "desc"
         logger.info("Start date is after end date - using descending order")
-        # Swap dates to ensure we iterate correctly
+        # Swap dates to create intervals, but we'll reverse the list
         start_dt, end_dt = end_dt, start_dt
     else:
         order = "asc"
@@ -558,9 +559,18 @@ def demo_collect_all(
         intervals.append((current_start, current_end))
         current_start = current_end + dt.timedelta(seconds=1)  # Move to next interval
 
-    logger.info(
-        f"Split date range into {len(intervals)} intervals of ~{interval_days} days each"
-    )
+    # If processing in reverse chronological order, reverse the intervals list
+    # so the most recent data is processed first
+    if reverse_order:
+        intervals.reverse()
+        logger.info(
+            f"Split date range into {len(intervals)} intervals of ~{interval_days} days each "
+            f"(reversed for descending order - processing newest first)"
+        )
+    else:
+        logger.info(
+            f"Split date range into {len(intervals)} intervals of ~{interval_days} days each"
+        )
 
     # Prepare manager parameters for subprocess recreation
     manager_params = {
@@ -610,8 +620,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     print("Collect all")
     result = demo_collect_all(
-        start_date="1990-03-01",
-        end_date="2025-10-01"
+        start_date="2025-10-01",
+        end_date="1990-03-01",
     )
     total_images = sum(len(paths) for paths in result.values())
     print(f"Successfully collected {total_images} images across {len(result)} monuments")
