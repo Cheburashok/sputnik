@@ -1,0 +1,14 @@
+{
+  "asset_name": "PRODUCT",
+  "asset_type": "application/octet-stream",
+  "bbox": [
+    46.153049,
+    39.037053,
+    46.207037,
+    39.061982
+  ],
+  "cloud_cover": 2.71160679626146,
+  "collection": "SENTINEL-2",
+  "feature_id": "S2B_MSIL1C_20181215T074319_N0500_R092_T38SPJ_20230725T122725.SAFE",
+  "timestamp": "2018-12-15T07:43:19.024000Z"
+}
