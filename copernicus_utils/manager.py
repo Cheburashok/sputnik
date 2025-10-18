@@ -503,7 +503,7 @@ def collect_all(
     max_cloud_cover: float = 100.0,
     token_path: Optional[Path] = None,
     collection: Collection = "SENTINEL-2",
-    n_cpu: int = 4,
+    n_cpu: int = 1,
 ) -> dict[str, List[Path]]:
     """Collect imagery for all monuments across a date range using parallel processing.
 
