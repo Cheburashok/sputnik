@@ -494,7 +494,7 @@ def _process_interval(args):
     )
 
 
-def demo_collect_all(
+def collect_all(
     start_date: str,
     end_date: str,
     monuments_csv: Path | str = Path("data/monuments.csv"),
@@ -619,7 +619,7 @@ __all__ = ["MonumentImageManager", "demo_collect_all", "Monument"]
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     print("Collect all")
-    result = demo_collect_all(
+    result = collect_all(
         start_date="2025-10-01",
         end_date="1990-03-01",
     )
