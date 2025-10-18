@@ -102,7 +102,7 @@ def _generate_token_from_credentials(credentials_path: Path = Path(".credentials
     }
 
     try:
-        response = requests.post(token_url, data=data, timeout=30)
+        response = requests.post(token_url, data=data, timeout=300)
         response.raise_for_status()
         token_data = response.json()
         access_token = token_data.get("access_token")
@@ -263,7 +263,7 @@ def _search_features(
     }
 
     # STAC search endpoint is publicly accessible and does not require authentication
-    response = requests.post(STAC_SEARCH_URL, headers={"Content-Type": "application/json"}, json=payload, timeout=300)
+    response = requests.post(STAC_SEARCH_URL, headers={"Content-Type": "application/json"}, json=payload, timeout=1000)
     if response.status_code != 200:
         raise CopernicusAPIError(
             "Copernicus STAC search failed with status "
@@ -284,7 +284,7 @@ def _download_asset(href: str, token: str) -> bytes:
     For small assets like thumbnails/previews only. Use _download_asset_to_file
     for large PRODUCT downloads.
     """
-    timeout = 120
+    timeout = 300
     logger.debug(f"Downloading asset from {href} (timeout={timeout}s)")
 
     response = requests.get(
@@ -314,7 +314,7 @@ def _download_asset_to_file(href: str, token: str, output_path: Path) -> int:
         Number of bytes downloaded.
     """
     # PRODUCT files can be several GB, so use longer timeout
-    timeout = 600
+    timeout = 900
 
     logger.debug(f"Streaming download from {href} to {output_path}")
 
@@ -326,7 +326,7 @@ def _download_asset_to_file(href: str, token: str, output_path: Path) -> int:
             href,
             headers={"Authorization": f"Bearer {token}"},
             allow_redirects=False,
-            timeout=30
+            timeout=300
         )
 
         if check_response.status_code in (301, 302, 303, 307, 308):
@@ -620,6 +620,7 @@ def fetch_all_images_in_period(
     collection: Collection = "SENTINEL-2",
     asset_type: AssetType = "PRODUCT",
     output_dir: Path | None = None,
+    order: str = "asc",
 ):
     """Generator that yields download info for high-quality images in a date range.
 
@@ -651,6 +652,9 @@ def fetch_all_images_in_period(
         or "QUICKLOOK" (preview image). Default is "PRODUCT".
     output_dir:
         Deprecated, no longer used.
+    order:
+        Sort order for results. Either "asc" (chronological) or "desc" (reverse
+        chronological). Default is "asc".
 
     Yields
     ------
@@ -698,7 +702,7 @@ def fetch_all_images_in_period(
         datetime_range=datetime_range,
         collection=collection,
         limit=days_in_interval,
-        order="asc",  # Chronological order
+        order=order,
         raise_on_empty=False,
     )
 

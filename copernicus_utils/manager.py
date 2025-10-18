@@ -10,6 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+from multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class MonumentImageManager:
         self.asset_type = asset_type
         self.token_path = token_path
         self.monuments = self._load_monuments(self.monuments_csv)
+        self._search_order = "asc"  # Default search order
 
     def _load_monuments(self, csv_path: Path) -> List[Monument]:
         monuments: List[Monument] = []
@@ -164,6 +166,8 @@ class MonumentImageManager:
 
         try:
             # Use generator to stream downloads one at a time
+            # Use the search order from manager (set by parallel processing)
+            search_order = getattr(self, '_search_order', 'asc')
             image_generator = fetch_all_images_in_period(
                 monument.bbox,
                 start_date=start_date,
@@ -172,6 +176,7 @@ class MonumentImageManager:
                 collection=self.collection,
                 asset_type=self.asset_type,
                 token_path=self.token_path,
+                order=search_order,
             )
 
             for item in image_generator:
@@ -456,47 +461,146 @@ class MonumentImageManager:
         return results
 
 
-def demo_collect_all(
-    monuments_csv: Path | str = Path("data/monuments.csv"),
-    *,
-    storage_root: Path | str = Path("data/collections"),
-    lookback_days: int = 30,
-    max_cloud_cover: float = 30.0,
-    token_path: Optional[Path] = None,
-    collection: Collection = "SENTINEL-2",
-) -> List[Path]:
-    """Example usage that collects the latest imagery for all monuments.
+def _process_interval(args):
+    """Helper function for parallel processing of date intervals.
 
     Parameters
     ----------
+    args:
+        Tuple containing (manager_params, interval_start, interval_end, order)
+
+    Returns
+    -------
+    dict:
+        Dictionary mapping monument names to lists of stored image paths.
+    """
+    manager_params, interval_start, interval_end, order = args
+
+    # Recreate manager in subprocess
+    manager = MonumentImageManager(**manager_params)
+
+    # Store order in manager for passing to API
+    manager._search_order = order
+
+    logger.info(
+        f"Processing interval: {interval_start.date()} to {interval_end.date()} "
+        f"(order={order})"
+    )
+
+    return manager.collect_time_series_for_all_monuments(
+        start_date=interval_start,
+        end_date=interval_end,
+        interval=None
+    )
+
+
+def demo_collect_all(
+    start_date: str,
+    end_date: str,
+    monuments_csv: Path | str = Path("data/monuments.csv"),
+    *,
+    storage_root: Path | str = Path("data/collections"),
+    max_cloud_cover: float = 100.0,
+    token_path: Optional[Path] = None,
+    collection: Collection = "SENTINEL-2",
+    n_cpu: int = 10,
+) -> dict[str, List[Path]]:
+    """Collect imagery for all monuments across a date range using parallel processing.
+
+    The date range is split into 30-day intervals, and each interval is processed
+    in parallel using multiple CPUs.
+
+    Parameters
+    ----------
+    start_date:
+        Start date as ISO string (e.g., "2023-03-01").
+    end_date:
+        End date as ISO string (e.g., "2024-09-01").
     monuments_csv:
         Path to CSV file containing monument data (name, bbox coordinates).
     storage_root:
         Root directory for storing downloaded images.
-    lookback_days:
-        Number of days to look back from today. Default: 30 days (1 month).
     max_cloud_cover:
-        Maximum acceptable cloud cover percentage (0-100). Default: 30%.
+        Maximum acceptable cloud cover percentage (0-100). Default: 100%.
     token_path:
         Path to Copernicus access token file.
     collection:
         STAC collection name. Default: "SENTINEL-2".
-    """
+    n_cpu:
+        Number of CPUs to use for parallel processing. Default: 10.
 
-    manager = MonumentImageManager(
-        monuments_csv,
-        storage_root=storage_root,
-        lookback_days=lookback_days,
-        max_cloud_cover=max_cloud_cover,
-        token_path=token_path,
-        collection=collection,
-        asset_type="PRODUCT",
+    Returns
+    -------
+    dict[str, List[Path]]:
+        Dictionary mapping monument names to lists of stored image paths.
+    """
+    # Parse date strings
+    start_dt = dt.datetime.fromisoformat(start_date).replace(tzinfo=dt.timezone.utc)
+    end_dt = dt.datetime.fromisoformat(end_date).replace(tzinfo=dt.timezone.utc)
+
+    # Determine search order based on date comparison
+    if start_dt > end_dt:
+        order = "desc"
+        logger.info("Start date is after end date - using descending order")
+        # Swap dates to ensure we iterate correctly
+        start_dt, end_dt = end_dt, start_dt
+    else:
+        order = "asc"
+        logger.info("Using ascending (chronological) order")
+
+    # Split date range into 30-day intervals
+    intervals = []
+    current_start = start_dt
+    interval_days = 30
+
+    while current_start < end_dt:
+        current_end = min(current_start + dt.timedelta(days=interval_days), end_dt)
+        intervals.append((current_start, current_end))
+        current_start = current_end + dt.timedelta(seconds=1)  # Move to next interval
+
+    logger.info(
+        f"Split date range into {len(intervals)} intervals of ~{interval_days} days each"
     )
-    return manager.collect_time_series_for_all_monuments(
-        start_date=dt.date(2020, 7, 1),
-        end_date=dt.date(2022, 7, 1),
-        interval=30
+
+    # Prepare manager parameters for subprocess recreation
+    manager_params = {
+        "monuments_csv": monuments_csv,
+        "storage_root": storage_root,
+        "lookback_days": 30,  # Not used in time series collection
+        "max_cloud_cover": max_cloud_cover,
+        "token_path": token_path,
+        "collection": collection,
+        "asset_type": "PRODUCT",
+    }
+
+    # Prepare arguments for parallel processing
+    process_args = [
+        (manager_params, interval_start, interval_end, order)
+        for interval_start, interval_end in intervals
+    ]
+
+    # Process intervals in parallel
+    logger.info(f"Starting parallel processing with {n_cpu} CPUs")
+
+    with Pool(processes=n_cpu) as pool:
+        results = pool.map(_process_interval, process_args)
+
+    # Merge results from all intervals
+    merged_results: dict[str, List[Path]] = {}
+    for interval_result in results:
+        for monument_name, paths in interval_result.items():
+            if monument_name not in merged_results:
+                merged_results[monument_name] = []
+            merged_results[monument_name].extend(paths)
+
+    # Log summary
+    total_images = sum(len(paths) for paths in merged_results.values())
+    logger.info(
+        f"Completed parallel collection: {total_images} total images across "
+        f"{len(merged_results)} monuments"
     )
+
+    return merged_results
 
 
 __all__ = ["MonumentImageManager", "demo_collect_all", "Monument"]
@@ -505,5 +609,9 @@ __all__ = ["MonumentImageManager", "demo_collect_all", "Monument"]
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     print("Collect all")
-    result = demo_collect_all()
-    print(f"Successfully collected {len(result)} images")
+    result = demo_collect_all(
+        start_date="1990-03-01",
+        end_date="2025-10-01"
+    )
+    total_images = sum(len(paths) for paths in result.values())
+    print(f"Successfully collected {total_images} images across {len(result)} monuments")

@@ -14,8 +14,6 @@ dependencies = [
   "Pillow==11.1.0",
   "rasterio>=1.4.3",
   "fastapi>=0.111.0",
-  "torch>=2.3.0",
-  "transformers>=4.38.0",
   "uvicorn[standard]>=0.30.0",
 ]
 

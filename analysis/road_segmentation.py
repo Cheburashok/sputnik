@@ -4,78 +4,127 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
-import torch
+import matplotlib.pyplot as plt
+import numpy as np
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
 
+import io
+from dataclasses import dataclass, field
+from typing import Optional
 
-MODEL_NAME = "valeo/segformer-b0-finetuned-cityscapes-1024-1024"
+import numpy as np
+from PIL import Image
+
+try:
+    from mmengine.registry import init_default_scope
+    from mmseg.apis import SegInferencer
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency error path
+    raise ModuleNotFoundError(
+        "mmsegmentation and its dependencies must be installed to use the road "
+        "segmentation tools"
+    ) from exc
+
+MODEL_NAME = "deeplabv3plus_r101-d8_769x769_80k_deepglobe"
+MODEL_CHECKPOINT = (
+    "https://download.openmmlab.com/mmsegmentation/v0.5/deeplabv3plus/"
+    "deeplabv3plus_r101-d8_769x769_80k_deepglobe_20211020_204507-a8f35505.pth"
+)
+ROAD_LABEL_ID = 1
 
 
 @dataclass
 class RoadSegmentationModel:
-    """Wrapper around a pretrained model to extract road masks."""
+    """Wrapper around a pretrained DeepLabV3+ model to extract road masks."""
 
     model_name: str = MODEL_NAME
+    checkpoint_url: str = MODEL_CHECKPOINT
     device: str = "cpu"
-    _processor: Optional[AutoImageProcessor] = None
-    _model: Optional[AutoModelForSemanticSegmentation] = None
-    _road_label_id: Optional[int] = None
-    _torch_device: torch.device = field(init=False)
+    _inferencer: Optional[SegInferencer] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self._torch_device = torch.device(self.device)
-        self._load_model()
-
-    def _load_model(self) -> None:
-        self._processor = AutoImageProcessor.from_pretrained(self.model_name)
-        self._model = AutoModelForSemanticSegmentation.from_pretrained(self.model_name)
-        self._model.to(self._torch_device)
-        self._model.eval()
-
-        id2label = {int(key): value for key, value in self._model.config.id2label.items()}
-        for label_id, label in id2label.items():
-            if label.lower() == "road":
-                self._road_label_id = label_id
-                break
-
-        if self._road_label_id is None:
-            raise ValueError(
-                "The configured model does not expose a 'road' label."
-            )
+        # Ensure the mmseg registry scope is available so that bundled config aliases
+        # (like the DeepGlobe road model) resolve correctly.
+        init_default_scope("mmseg")
+        self._inferencer = SegInferencer(
+            model=self.model_name,
+            pretrained=self.checkpoint_url,
+            device=self.device,
+        )
 
     @property
     def road_label_id(self) -> int:
-        assert self._road_label_id is not None
-        return self._road_label_id
+        return ROAD_LABEL_ID
 
-    @torch.inference_mode()
-    def predict_from_image(self, image: Image.Image) -> Image.Image:
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        inputs = self._processor(images=image, return_tensors="pt")
-        inputs = {key: value.to(self._torch_device) for key, value in inputs.items()}
-
-        outputs = self._model(**inputs)
-        logits = outputs.logits
-        upsampled_logits = F.interpolate(
-            logits,
-            size=image.size[::-1],
-            mode="bilinear",
-            align_corners=False,
+    def _run_inference(self, image: Image.Image) -> np.ndarray:
+        # MMDetection / MMSegmentation pipelines operate on BGR numpy arrays.
+        rgb_image = image.convert("RGB")
+        bgr_image = np.array(rgb_image)[:, :, ::-1]
+        result = self._inferencer(
+            bgr_image,
+            show=False,
+            no_save_vis=True,
+            return_datasample=False,
         )
+        prediction = result["predictions"][0]
+        return prediction
 
-        predicted_classes = upsampled_logits.argmax(dim=1)
-        road_mask = (predicted_classes == self.road_label_id).to(torch.uint8)
-
-        mask = road_mask.squeeze(0).cpu().numpy() * 255
-        return Image.fromarray(mask, mode="L")
+    def predict_from_image(self, image: Image.Image) -> Image.Image:
+        prediction = self._run_inference(image)
+        road_mask = (prediction == self.road_label_id).astype(np.uint8) * 255
+        return Image.fromarray(road_mask, mode="L")
 
     def predict_from_bytes(self, image_bytes: bytes) -> Image.Image:
         with Image.open(io.BytesIO(image_bytes)) as image:
             image.load()
             return self.predict_from_image(image)
+
+
+def segment_and_save_mask(
+    input_image_path: Union[str, Path],
+    output_mask_path: Union[str, Path],
+    model: Optional[RoadSegmentationModel] = None,
+    device: str = "cpu",
+) -> None:
+    """
+    Run road segmentation on an image file and save the mask with yellow/violet colormap.
+
+    Args:
+        input_image_path: Path to the input image file
+        output_mask_path: Path where the colored mask will be saved (PNG format)
+        model: Optional pre-initialized RoadSegmentationModel. If None, a new model will be created
+        device: Device to run the model on ("cpu" or "cuda")
+    """
+    # Load the model if not provided
+    if model is None:
+        model = RoadSegmentationModel(device=device)
+
+    # Load the input image
+    input_image = Image.open(input_image_path)
+
+    # Run segmentation
+    mask = model.predict_from_image(input_image)
+
+    # Convert mask to numpy array and normalize to [0, 1]
+    mask_array = np.array(mask) / 255.0
+
+    # Apply matplotlib's viridis colormap (yellow/violet)
+    cmap = plt.get_cmap("viridis")
+    colored_mask = cmap(mask_array)
+
+    # Convert to RGB (remove alpha channel) and scale to 0-255
+    colored_mask_rgb = (colored_mask[:, :, :3] * 255).astype(np.uint8)
+
+    # Save the colored mask
+    output_image = Image.fromarray(colored_mask_rgb, mode="RGB")
+    output_image.save(output_mask_path)
+
+
+if __name__ == '__main__':
+    segment_and_save_mask(
+        "C:\\Users\\dell\\OneDrive\\Desktop\\sputnik\\data\\collections\\Zvarivank\\images\\2020-06-10T07-46-19_024000Z__46_153049_39_037053_46_207037_39_061982.png",
+        "C:\\Users\\dell\\OneDrive\\Desktop\\sputnik\\data\\collections\\Zvarivank\\road_masks\\2020-06-10T07-46-19_024000Z__46_153049_39_037053_46_207037_39_061982.png"
+    )
