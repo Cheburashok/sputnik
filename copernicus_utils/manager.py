@@ -10,7 +10,6 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
-from multiprocessing import Pool
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +79,138 @@ class MonumentImageManager:
         return monuments
 
     # ------------------------------------------------------------------
+    # Helper methods
+    def _get_storage_directories(self, collection: GeospatialCollection) -> tuple[Path, Path]:
+        """Get image and metadata directories based on asset type."""
+        if self.asset_type == "QUICKLOOK":
+            images_dir = collection.collection_dir / "quicklook"
+            metadata_dir = collection.collection_dir / "quicklook_metadata"
+        else:  # PRODUCT
+            images_dir = collection.images_dir
+            metadata_dir = collection.metadata_dir
+        return images_dir, metadata_dir
+
+    def _parse_image_timestamp(self, metadata: dict) -> Optional[dt.datetime]:
+        """Parse ISO8601 timestamp from image metadata."""
+        timestamp_str = metadata.get("timestamp")
+        if timestamp_str:
+            return dt.datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        return None
+
+    def _should_skip_existing(self, metadata_path: Path, item: dict) -> bool:
+        """Check if image already exists and should be skipped."""
+        if metadata_path.exists():
+            logger.info(f"  Skipping {item['index']}/{item['total']}: already exists")
+            return True
+        return False
+
+    def _should_skip_by_interval(
+        self,
+        image_date: Optional[dt.datetime],
+        last_downloaded_date: Optional[dt.datetime],
+        interval: Optional[int],
+        item: dict
+    ) -> bool:
+        """Check if image should be skipped based on interval filtering."""
+        if interval is None or last_downloaded_date is None or image_date is None:
+            return False
+
+        days_since_last = (image_date - last_downloaded_date).days
+        if days_since_last < interval:
+            logger.info(
+                f"  Skipping {item['index']}/{item['total']}: "
+                f"only {days_since_last} days since last image (interval={interval})"
+            )
+            return True
+        return False
+
+    def _save_metadata(self, metadata_path: Path, metadata: dict) -> None:
+        """Save image metadata to JSON file."""
+        import json
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8"
+        )
+
+    def _extract_tci_from_safe_archive(self, zip_path: Path, monument: Monument, base: str, images_dir: Path) -> Path:
+        """Extract and process TCI from SAFE archive.
+
+        Downloads SAFE archive, extracts TCI, crops to bbox, and converts to PNG.
+        """
+        # Find and extract TCI_10m.jp2 from SAFE archive
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            tci_jp2_path = self._find_tci_in_archive(zf)
+
+            # Extract TCI to temporary location
+            with tempfile.TemporaryDirectory() as extract_dir:
+                extract_path = Path(extract_dir)
+                tci_extracted = extract_path / Path(tci_jp2_path).name
+
+                # Extract the TCI file
+                with zf.open(tci_jp2_path) as source:
+                    tci_extracted.write_bytes(source.read())
+
+                # Crop TCI to monument bbox
+                cropped_tif = extract_path / "cropped.tif"
+                crop_tci_to_bbox(
+                    str(tci_extracted),
+                    monument.bbox,
+                    str(cropped_tif),
+                    overviews=False  # Don't need overviews for PNG conversion
+                )
+
+                # Convert cropped TIF to PNG
+                png_path = images_dir / f"{base}.png"
+                tif_to_png(
+                    str(cropped_tif),
+                    str(png_path),
+                    normalize=True
+                )
+
+                return png_path
+
+    def _find_tci_in_archive(self, zf: zipfile.ZipFile) -> str:
+        """Find TCI file path in SAFE archive."""
+        for name in zf.namelist():
+            # Look for TCI file (10m resolution)
+            if "_TCI_10m.jp2" in name or "_TCI.jp2" in name:
+                return name
+        raise FileNotFoundError("TCI file not found in SAFE archive")
+
+    def _download_quicklook_asset(self, href: str, token: str, image_path: Path) -> None:
+        """Download QUICKLOOK asset (small file, to memory)."""
+        from .copernicus_api import _download_asset
+        content = _download_asset(href, token)
+        image_path.write_bytes(content)
+
+    def _download_product_asset(
+        self,
+        href: str,
+        token: str,
+        monument: Monument,
+        base: str,
+        images_dir: Path
+    ) -> Path:
+        """Download and process PRODUCT asset (large file, stream to disk).
+
+        Downloads SAFE archive, extracts TCI, crops to bbox, converts to PNG.
+        """
+        # Download to temp file, extract TCI, crop, convert to PNG
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+
+        try:
+            # Download SAFE archive to temp file
+            _download_asset_to_file(href, token, tmp_path)
+
+            # Extract and process TCI
+            return self._extract_tci_from_safe_archive(tmp_path, monument, base, images_dir)
+        finally:
+            # Clean up temporary SAFE archive
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    # ------------------------------------------------------------------
     # Fetching
     def fetch_latest_for_monument(self, monument: Monument) -> Optional[CopernicusImage]:
         try:
@@ -107,6 +238,62 @@ class MonumentImageManager:
             stored = collection.save(image)
             stored_paths.append(stored.image_path)
         return stored_paths
+
+    def _process_single_image(
+        self,
+        item: dict,
+        monument: Monument,
+        collection: GeospatialCollection,
+        images_dir: Path,
+        metadata_dir: Path,
+        last_downloaded_date: Optional[dt.datetime],
+        interval: Optional[int]
+    ) -> tuple[Optional[Path], Optional[dt.datetime]]:
+        """Process a single image from the API response.
+
+        Returns
+        -------
+        tuple[Optional[Path], Optional[dt.datetime]]:
+            Tuple of (image_path, updated_last_download_date).
+            Returns (None, last_date) if image was skipped.
+        """
+        # Build output path based on metadata
+        base = collection._build_base_filename(item["metadata"])
+        image_path = images_dir / f"{base}{item['extension']}"
+        metadata_path = metadata_dir / f"{base}.json"
+
+        # Parse image timestamp
+        image_date = self._parse_image_timestamp(item["metadata"])
+
+        # Skip if already downloaded
+        if self._should_skip_existing(metadata_path, item):
+            # Update last downloaded date if we have this image
+            updated_last_date = image_date if image_date else last_downloaded_date
+            return image_path, updated_last_date
+
+        # Apply interval filter if specified
+        if self._should_skip_by_interval(image_date, last_downloaded_date, interval, item):
+            return None, last_downloaded_date
+
+        # Download and process the image
+        token = _read_token(item["token_path"])
+        logger.info(
+            f"  Downloading {item['index']}/{item['total']}: "
+            f"{item['metadata']['timestamp']}"
+        )
+
+        # Download based on asset type
+        if self.asset_type == "QUICKLOOK":
+            self._download_quicklook_asset(item["href"], token, image_path)
+        else:
+            image_path = self._download_product_asset(
+                item["href"], token, monument, base, images_dir
+            )
+
+        # Save metadata
+        self._save_metadata(metadata_path, item["metadata"])
+
+        return image_path, image_date
 
     def collect_time_series_for_monument(
         self,
@@ -150,14 +337,8 @@ class MonumentImageManager:
 
         collection = GeospatialCollection(self.storage_root, monument.name)
 
-        # Use different directory based on asset type
-        if self.asset_type == "QUICKLOOK":
-            images_dir = collection.collection_dir / "quicklook"
-            metadata_dir = collection.collection_dir / "quicklook_metadata"
-        else:  # PRODUCT
-            images_dir = collection.images_dir
-            metadata_dir = collection.metadata_dir
-
+        # Setup directories
+        images_dir, metadata_dir = self._get_storage_directories(collection)
         images_dir.mkdir(parents=True, exist_ok=True)
         metadata_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,7 +347,6 @@ class MonumentImageManager:
 
         try:
             # Use generator to stream downloads one at a time
-            # Use the search order from manager (set by parallel processing)
             search_order = getattr(self, '_search_order', 'asc')
             image_generator = fetch_all_images_in_period(
                 monument.bbox,
@@ -181,119 +361,12 @@ class MonumentImageManager:
 
             for item in image_generator:
                 try:
-                    # Build output path based on metadata
-                    base = collection._build_base_filename(item["metadata"])
-                    image_path = images_dir / f"{base}{item['extension']}"
-                    metadata_path = metadata_dir / f"{base}.json"
-
-                    # Parse image timestamp
-                    timestamp_str = item["metadata"].get("timestamp")
-                    if timestamp_str:
-                        # Parse ISO8601 timestamp
-                        image_date = dt.datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                    else:
-                        image_date = None
-
-                    # Skip if already downloaded
-                    if metadata_path.exists():
-                        logger.info(f"  Skipping {item['index']}/{item['total']}: already exists")
+                    image_path, last_downloaded_date = self._process_single_image(
+                        item, monument, collection, images_dir, metadata_dir,
+                        last_downloaded_date, interval
+                    )
+                    if image_path:
                         stored_paths.append(image_path)
-                        # Update last downloaded date if we have this image
-                        if image_date:
-                            last_downloaded_date = image_date
-                        continue
-
-                    # Apply interval filter if specified
-                    if interval is not None and last_downloaded_date is not None and image_date is not None:
-                        days_since_last = (image_date - last_downloaded_date).days
-                        if days_since_last < interval:
-                            logger.info(
-                                f"  Skipping {item['index']}/{item['total']}: "
-                                f"only {days_since_last} days since last image (interval={interval})"
-                            )
-                            continue
-
-                    # Get fresh token
-                    token = _read_token(item["token_path"])
-                    logger.info(
-                        f"  Downloading {item['index']}/{item['total']}: "
-                        f"{item['metadata']['timestamp']}"
-                    )
-
-                    # Use appropriate download method based on asset type
-                    if self.asset_type == "QUICKLOOK":
-                        # QUICKLOOK is small (~1MB), download to memory
-                        from .copernicus_api import _download_asset
-                        content = _download_asset(item["href"], token)
-                        image_path.write_bytes(content)
-                    else:
-                        # PRODUCT is large (800MB+), stream to disk
-                        # Download to temp file, extract TCI, crop, convert to PNG
-                        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
-                            tmp_path = Path(tmp_file.name)
-
-                        try:
-                            # Download SAFE archive to temp file
-                            _download_asset_to_file(item["href"], token, tmp_path)
-
-                            # Find and extract TCI_10m.jp2 from SAFE archive
-                            tci_jp2_path = None
-                            with zipfile.ZipFile(tmp_path, 'r') as zf:
-                                for name in zf.namelist():
-                                    # Look for TCI file (10m resolution)
-                                    if "_TCI_10m.jp2" in name or "_TCI.jp2" in name:
-                                        tci_jp2_path = name
-                                        break
-
-                                if not tci_jp2_path:
-                                    raise FileNotFoundError("TCI file not found in SAFE archive")
-
-                                # Extract TCI to temporary location
-                                with tempfile.TemporaryDirectory() as extract_dir:
-                                    extract_path = Path(extract_dir)
-                                    tci_extracted = extract_path / Path(tci_jp2_path).name
-
-                                    # Extract the TCI file
-                                    with zf.open(tci_jp2_path) as source:
-                                        tci_extracted.write_bytes(source.read())
-
-                                    # Crop TCI to monument bbox
-                                    cropped_tif = extract_path / "cropped.tif"
-                                    crop_tci_to_bbox(
-                                        str(tci_extracted),
-                                        monument.bbox,
-                                        str(cropped_tif),
-                                        overviews=False  # Don't need overviews for PNG conversion
-                                    )
-
-                                    # Convert cropped TIF to PNG
-                                    png_path = images_dir / f"{base}.png"
-                                    tif_to_png(
-                                        str(cropped_tif),
-                                        str(png_path),
-                                        normalize=True
-                                    )
-
-                                    # Update image_path to point to PNG
-                                    image_path = png_path
-
-                        finally:
-                            # Clean up temporary SAFE archive
-                            if tmp_path.exists():
-                                tmp_path.unlink()
-
-                    # Save metadata
-                    import json
-                    metadata_path.write_text(
-                        json.dumps(item["metadata"], indent=2, sort_keys=True),
-                        encoding="utf-8"
-                    )
-
-                    stored_paths.append(image_path)
-
-                    # Update last downloaded date for interval tracking
-                    if image_date:
-                        last_downloaded_date = image_date
 
                 except Exception as e:
                     logger.warning(
@@ -461,40 +534,94 @@ class MonumentImageManager:
         return results
 
 
-def _process_interval(args):
-    """Helper function for parallel processing of date intervals.
-
-    Parameters
-    ----------
-    args:
-        Tuple containing (manager_params, interval_start, interval_end, order)
+def _determine_search_order(start_dt: dt.datetime, end_dt: dt.datetime) -> tuple[str, dt.datetime, dt.datetime]:
+    """Determine search order and normalize date range.
 
     Returns
     -------
-    dict:
-        Dictionary mapping monument names to lists of stored image paths.
+    tuple[str, dt.datetime, dt.datetime]:
+        Tuple of (order, normalized_start, normalized_end).
+        If dates are reversed, swaps them and returns 'desc', otherwise 'asc'.
     """
-    manager_params, interval_start, interval_end, order = args
-
-    # Recreate manager in subprocess
-    manager = MonumentImageManager(**manager_params)
-
-    # Store order in manager for passing to API
-    manager._search_order = order
-
-    logger.info(
-        f"Processing interval: {interval_start.date()} to {interval_end.date()} "
-        f"(order={order})"
-    )
-
-    return manager.collect_time_series_for_all_monuments(
-        start_date=interval_start,
-        end_date=interval_end,
-        interval=None
-    )
+    reverse_order = start_dt > end_dt
+    if reverse_order:
+        order = "desc"
+        logger.info("Start date is after end date - using descending order")
+        # Swap dates to create intervals, but we'll reverse the list
+        return order, end_dt, start_dt
+    else:
+        order = "asc"
+        logger.info("Using ascending (chronological) order")
+        return order, start_dt, end_dt
 
 
-def collect_all(
+def _create_date_intervals(
+    start_dt: dt.datetime,
+    end_dt: dt.datetime,
+    interval_days: int = 30,
+    reverse: bool = False
+) -> List[tuple[dt.datetime, dt.datetime]]:
+    """Split date range into non-overlapping intervals.
+
+    Parameters
+    ----------
+    start_dt:
+        Start datetime (must be before or equal to end_dt).
+    end_dt:
+        End datetime.
+    interval_days:
+        Number of days per interval. Default is 30.
+    reverse:
+        If True, reverse the intervals list (newest first).
+
+    Returns
+    -------
+    List[tuple[dt.datetime, dt.datetime]]:
+        List of (interval_start, interval_end) tuples.
+    """
+    intervals = []
+    current_start = start_dt
+
+    while current_start < end_dt:
+        # Use min() to handle the last interval which might be shorter
+        current_end = min(
+            current_start + dt.timedelta(days=interval_days - 1, hours=23, minutes=59, seconds=59),
+            end_dt
+        )
+        intervals.append((current_start, current_end))
+        # Move to next day to avoid overlap
+        current_start = current_end + dt.timedelta(seconds=1)
+
+    # If processing in reverse chronological order, reverse the intervals list
+    if reverse:
+        intervals.reverse()
+        logger.info(
+            f"Split date range into {len(intervals)} non-overlapping intervals of ~{interval_days} days each "
+            f"(reversed for descending order - processing newest first)"
+        )
+    else:
+        logger.info(
+            f"Split date range into {len(intervals)} non-overlapping intervals of ~{interval_days} days each"
+        )
+
+    return intervals
+
+
+def _merge_interval_results(
+    merged_results: dict[str, List[Path]],
+    interval_results: dict[str, List[Path]]
+) -> None:
+    """Merge results from a single interval into the accumulated results.
+
+    Modifies merged_results in place.
+    """
+    for monument_name, paths in interval_results.items():
+        if monument_name not in merged_results:
+            merged_results[monument_name] = []
+        merged_results[monument_name].extend(paths)
+
+
+def demo_collect_all(
     start_date: str,
     end_date: str,
     monuments_csv: Path | str = Path("data/monuments.csv"),
@@ -503,12 +630,11 @@ def collect_all(
     max_cloud_cover: float = 100.0,
     token_path: Optional[Path] = None,
     collection: Collection = "SENTINEL-2",
-    n_cpu: int = 1,
 ) -> dict[str, List[Path]]:
-    """Collect imagery for all monuments across a date range using parallel processing.
+    """Collect imagery for all monuments across a date range in 30-day intervals.
 
-    The date range is split into 30-day intervals, and each interval is processed
-    in parallel using multiple CPUs.
+    The date range is split into non-overlapping 30-day intervals, processed sequentially
+    to avoid file write conflicts.
 
     Parameters
     ----------
@@ -526,8 +652,6 @@ def collect_all(
         Path to Copernicus access token file.
     collection:
         STAC collection name. Default: "SENTINEL-2".
-    n_cpu:
-        Number of CPUs to use for parallel processing. Default: 10.
 
     Returns
     -------
@@ -538,75 +662,53 @@ def collect_all(
     start_dt = dt.datetime.fromisoformat(start_date).replace(tzinfo=dt.timezone.utc)
     end_dt = dt.datetime.fromisoformat(end_date).replace(tzinfo=dt.timezone.utc)
 
-    # Determine search order based on date comparison
-    reverse_order = start_dt > end_dt
-    if reverse_order:
-        order = "desc"
-        logger.info("Start date is after end date - using descending order")
-        # Swap dates to create intervals, but we'll reverse the list
-        start_dt, end_dt = end_dt, start_dt
-    else:
-        order = "asc"
-        logger.info("Using ascending (chronological) order")
+    # Determine search order and normalize date range
+    order, normalized_start, normalized_end = _determine_search_order(start_dt, end_dt)
+    reverse_order = (order == "desc")
 
-    # Split date range into 30-day intervals
-    intervals = []
-    current_start = start_dt
-    interval_days = 30
+    # Split date range into non-overlapping 30-day intervals
+    intervals = _create_date_intervals(
+        normalized_start,
+        normalized_end,
+        interval_days=30,
+        reverse=reverse_order
+    )
 
-    while current_start < end_dt:
-        current_end = min(current_start + dt.timedelta(days=interval_days), end_dt)
-        intervals.append((current_start, current_end))
-        current_start = current_end + dt.timedelta(seconds=1)  # Move to next interval
+    # Create manager
+    manager = MonumentImageManager(
+        monuments_csv,
+        storage_root=storage_root,
+        lookback_days=30,  # Not used in time series collection
+        max_cloud_cover=max_cloud_cover,
+        token_path=token_path,
+        collection=collection,
+        asset_type="PRODUCT",
+    )
 
-    # If processing in reverse chronological order, reverse the intervals list
-    # so the most recent data is processed first
-    if reverse_order:
-        intervals.reverse()
-        logger.info(
-            f"Split date range into {len(intervals)} intervals of ~{interval_days} days each "
-            f"(reversed for descending order - processing newest first)"
-        )
-    else:
-        logger.info(
-            f"Split date range into {len(intervals)} intervals of ~{interval_days} days each"
-        )
+    # Set search order
+    manager._search_order = order
 
-    # Prepare manager parameters for subprocess recreation
-    manager_params = {
-        "monuments_csv": monuments_csv,
-        "storage_root": storage_root,
-        "lookback_days": 30,  # Not used in time series collection
-        "max_cloud_cover": max_cloud_cover,
-        "token_path": token_path,
-        "collection": collection,
-        "asset_type": "PRODUCT",
-    }
-
-    # Prepare arguments for parallel processing
-    process_args = [
-        (manager_params, interval_start, interval_end, order)
-        for interval_start, interval_end in intervals
-    ]
-
-    # Process intervals in parallel
-    logger.info(f"Starting parallel processing with {n_cpu} CPUs")
-
-    with Pool(processes=n_cpu) as pool:
-        results = pool.map(_process_interval, process_args)
-
-    # Merge results from all intervals
+    # Process intervals sequentially to avoid file write conflicts
     merged_results: dict[str, List[Path]] = {}
-    for interval_result in results:
-        for monument_name, paths in interval_result.items():
-            if monument_name not in merged_results:
-                merged_results[monument_name] = []
-            merged_results[monument_name].extend(paths)
+
+    for i, (interval_start, interval_end) in enumerate(intervals, 1):
+        logger.info(
+            f"Processing interval {i}/{len(intervals)}: {interval_start.date()} to {interval_end.date()}"
+        )
+
+        interval_results = manager.collect_time_series_for_all_monuments(
+            start_date=interval_start,
+            end_date=interval_end,
+            interval=None
+        )
+
+        # Merge results
+        _merge_interval_results(merged_results, interval_results)
 
     # Log summary
     total_images = sum(len(paths) for paths in merged_results.values())
     logger.info(
-        f"Completed parallel collection: {total_images} total images across "
+        f"Completed collection: {total_images} total images across "
         f"{len(merged_results)} monuments"
     )
 
@@ -619,8 +721,8 @@ __all__ = ["MonumentImageManager", "demo_collect_all", "Monument"]
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     print("Collect all")
-    result = collect_all(
-        start_date="2025-10-01",
+    result = demo_collect_all(
+        start_date="2023-12-02",
         end_date="1990-03-01",
     )
     total_images = sum(len(paths) for paths in result.values())
