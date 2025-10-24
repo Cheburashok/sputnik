@@ -169,6 +169,148 @@ class MonumentImageManager:
 
                 return png_path
 
+    def _extract_bands_from_safe_archive(
+        self,
+        zip_path: Path,
+        monument: Monument,
+        base: str,
+        images_dir: Path,
+        bands: List[str]
+    ) -> Path:
+        """Extract and merge specified bands from SAFE archive.
+
+        Downloads SAFE archive, extracts specified bands, merges them,
+        crops to bbox, and saves as GeoTIFF.
+
+        Parameters
+        ----------
+        zip_path:
+            Path to the SAFE archive zip file.
+        monument:
+            Monument with bbox information.
+        base:
+            Base filename for output.
+        images_dir:
+            Directory where output files should be saved.
+        bands:
+            List of band names to extract (e.g., ['B02', 'B03', 'B04', 'B08', 'B11', 'B12']).
+
+        Returns
+        -------
+        Path:
+            Path to the generated GeoTIFF file.
+
+        Notes
+        -----
+        Band files in SAFE archives are named like T38SPJ_20250601T073619_B02.jp2
+        and are located directly in the IMG_DATA directory. Bands at different
+        resolutions (10m, 20m, 60m) are automatically resampled to match the
+        resolution of the first band in the list using bilinear interpolation.
+        """
+        import numpy as np
+        import rasterio
+        from rasterio.windows import from_bounds
+        from rasterio.warp import transform_bounds
+
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            with tempfile.TemporaryDirectory() as extract_dir:
+                extract_path = Path(extract_dir)
+
+                # Find and extract each band
+                band_files = []
+                for band in bands:
+                    band_jp2_path = self._find_band_in_archive(zf, band)
+                    band_extracted = extract_path / Path(band_jp2_path).name
+
+                    # Extract the band file
+                    with zf.open(band_jp2_path) as source:
+                        band_extracted.write_bytes(source.read())
+
+                    band_files.append(band_extracted)
+
+                # Read and merge bands
+                # Use the first band as reference for georeferencing and target resolution
+                with rasterio.open(band_files[0]) as ref_src:
+                    # Reproject bbox to image CRS
+                    min_lon, min_lat, max_lon, max_lat = monument.bbox
+                    bbox_dst = transform_bounds(
+                        "EPSG:4326", ref_src.crs,
+                        min_lon, min_lat, max_lon, max_lat,
+                        densify_pts=21
+                    )
+
+                    # Store bbox bounds for reuse
+                    ref_bounds = bbox_dst
+
+                    # Read each band and resample to reference resolution
+                    band_arrays = []
+                    output_transform = None
+                    output_shape = None
+
+                    for i, band_file in enumerate(band_files):
+                        with rasterio.open(band_file) as src:
+                            # For the first band (reference), compute the output window
+                            if i == 0:
+                                # Compute pixel window intersecting the bbox
+                                win = from_bounds(*ref_bounds, transform=src.transform)
+                                win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+
+                                if win.width <= 0 or win.height <= 0:
+                                    raise ValueError("BBox does not intersect the image.")
+
+                                # Read the reference band
+                                data = src.read(1, window=win, boundless=False)
+                                output_shape = data.shape
+                                output_transform = rasterio.windows.transform(win, src.transform)
+                                band_arrays.append(data)
+
+                            else:
+                                # For other bands, compute window in their own resolution
+                                win = from_bounds(*ref_bounds, transform=src.transform)
+                                win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+
+                                # Read the band
+                                data = src.read(1, window=win, boundless=False)
+
+                                # If band has different resolution, resample to reference resolution
+                                if data.shape != output_shape:
+                                    from scipy.ndimage import zoom
+                                    zoom_factors = (
+                                        output_shape[0] / data.shape[0],
+                                        output_shape[1] / data.shape[1]
+                                    )
+                                    data = zoom(data, zoom_factors, order=1)  # Bilinear interpolation
+
+                                band_arrays.append(data)
+
+                    # Stack bands into a single multi-band array
+                    merged_data = np.stack(band_arrays, axis=0)
+
+                    # Use output dimensions from reference band
+                    transform = output_transform
+                    height = output_shape[0]
+                    width = output_shape[1]
+
+                    # Prepare output profile
+                    profile = ref_src.profile.copy()
+                    profile.update(
+                        driver="GTiff",
+                        height=height,
+                        width=width,
+                        count=len(bands),
+                        transform=transform,
+                        compress="DEFLATE",
+                        tiled=True,
+                        BIGTIFF="IF_SAFER",
+                    )
+
+                    # Write merged GeoTIFF
+                    tif_path = images_dir / f"{base}.tif"
+                    with rasterio.open(tif_path, "w", **profile) as dst:
+                        dst.write(merged_data)
+
+                    return tif_path
+
     def _find_tci_in_archive(self, zf: zipfile.ZipFile) -> str:
         """Find TCI file path in SAFE archive."""
         for name in zf.namelist():
@@ -176,6 +318,53 @@ class MonumentImageManager:
             if "_TCI_10m.jp2" in name or "_TCI.jp2" in name:
                 return name
         raise FileNotFoundError("TCI file not found in SAFE archive")
+
+    def _find_band_in_archive(self, zf: zipfile.ZipFile, band: str) -> str:
+        """Find a specific band file path in SAFE archive.
+
+        Parameters
+        ----------
+        zf:
+            Open ZipFile object for the SAFE archive.
+        band:
+            Band name to find (e.g., 'B02', 'B03', 'B04', 'B08', 'B11', 'B12').
+
+        Returns
+        -------
+        str:
+            Path to the band file within the archive.
+
+        Raises
+        ------
+        FileNotFoundError:
+            If the band file is not found in the archive.
+
+        Notes
+        -----
+        Sentinel-2 band files are typically named like:
+        - T38SPJ_20250601T073619_B02.jp2 (for band B02)
+        - T38SPJ_20250601T073619_B11.jp2 (for band B11)
+
+        Band resolutions:
+        - 10m resolution: B02, B03, B04, B08
+        - 20m resolution: B05, B06, B07, B8A, B11, B12
+        - 60m resolution: B01, B09, B10
+        """
+        # Look for the band file in IMG_DATA directory
+        # Pattern: .../IMG_DATA/..._{band}.jp2
+        for name in zf.namelist():
+            # Check if this is in IMG_DATA directory and matches the band
+            if "/IMG_DATA/" in name and name.endswith(f"_{band}.jp2"):
+                return name
+
+        # If not found with underscore, try without (some archives may vary)
+        for name in zf.namelist():
+            if "/IMG_DATA/" in name and f"_{band}." in name and name.endswith(".jp2"):
+                return name
+
+        raise FileNotFoundError(
+            f"Band {band} not found in SAFE archive IMG_DATA directory"
+        )
 
     def _download_quicklook_asset(self, href: str, token: str, image_path: Path) -> None:
         """Download QUICKLOOK asset (small file, to memory)."""
@@ -189,13 +378,36 @@ class MonumentImageManager:
         token: str,
         monument: Monument,
         base: str,
-        images_dir: Path
+        images_dir: Path,
+        bands: Optional[List[str]] = None
     ) -> Path:
         """Download and process PRODUCT asset (large file, stream to disk).
 
-        Downloads SAFE archive, extracts TCI, crops to bbox, converts to PNG.
+        Downloads SAFE archive, extracts either TCI or specified bands,
+        crops to bbox, and saves as PNG or GeoTIFF.
+
+        Parameters
+        ----------
+        href:
+            URL to download the asset from.
+        token:
+            Access token for authentication.
+        monument:
+            Monument with bbox information.
+        base:
+            Base filename for output.
+        images_dir:
+            Directory where output files should be saved.
+        bands:
+            Optional list of band names to extract (e.g., ['B02', 'B03', 'B04', 'B08', 'B11', 'B12']).
+            If None, extracts TCI and saves as PNG.
+
+        Returns
+        -------
+        Path:
+            Path to the generated PNG or GeoTIFF file.
         """
-        # Download to temp file, extract TCI, crop, convert to PNG
+        # Download to temp file, extract bands or TCI
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
             tmp_path = Path(tmp_file.name)
 
@@ -203,8 +415,17 @@ class MonumentImageManager:
             # Download SAFE archive to temp file
             _download_asset_to_file(href, token, tmp_path)
 
-            # Extract and process TCI
-            return self._extract_tci_from_safe_archive(tmp_path, monument, base, images_dir)
+            # Extract and process based on bands parameter
+            if bands is not None:
+                # Extract specified bands and save as GeoTIFF
+                return self._extract_bands_from_safe_archive(
+                    tmp_path, monument, base, images_dir, bands
+                )
+            else:
+                # Extract TCI and save as PNG (legacy behavior)
+                return self._extract_tci_from_safe_archive(
+                    tmp_path, monument, base, images_dir
+                )
         finally:
             # Clean up temporary SAFE archive
             if tmp_path.exists():
@@ -247,9 +468,16 @@ class MonumentImageManager:
         images_dir: Path,
         metadata_dir: Path,
         last_downloaded_date: Optional[dt.datetime],
-        interval: Optional[int]
+        interval: Optional[int],
+        bands: Optional[List[str]] = None
     ) -> tuple[Optional[Path], Optional[dt.datetime]]:
         """Process a single image from the API response.
+
+        Parameters
+        ----------
+        bands:
+            Optional list of band names to extract (e.g., ['B02', 'B03', 'B04', 'B08', 'B11', 'B12']).
+            If None, extracts TCI and saves as PNG.
 
         Returns
         -------
@@ -287,7 +515,7 @@ class MonumentImageManager:
             self._download_quicklook_asset(item["href"], token, image_path)
         else:
             image_path = self._download_product_asset(
-                item["href"], token, monument, base, images_dir
+                item["href"], token, monument, base, images_dir, bands
             )
 
         # Save metadata
@@ -301,6 +529,7 @@ class MonumentImageManager:
         start_date: dt.date | dt.datetime,
         end_date: dt.date | dt.datetime,
         interval: Optional[int] = None,
+        bands: Optional[List[str]] = None
     ) -> List[Path]:
         """Fetch all high-quality images for a monument within a date range.
 
@@ -324,6 +553,9 @@ class MonumentImageManager:
             Minimum number of days between downloaded images. If None, all images
             are downloaded. If specified, only images that are at least 'interval'
             days apart from the previous downloaded image will be included.
+        bands:
+            Optional list of band names to extract (e.g., ['B02', 'B03', 'B04', 'B08', 'B11', 'B12']).
+            If None, extracts TCI and saves as PNG. Only applicable when asset_type is PRODUCT.
 
         Returns
         -------
@@ -363,7 +595,7 @@ class MonumentImageManager:
                 try:
                     image_path, last_downloaded_date = self._process_single_image(
                         item, monument, collection, images_dir, metadata_dir,
-                        last_downloaded_date, interval
+                        last_downloaded_date, interval, bands
                     )
                     if image_path:
                         stored_paths.append(image_path)
@@ -388,6 +620,7 @@ class MonumentImageManager:
         start_date: dt.date | dt.datetime,
         end_date: dt.date | dt.datetime,
         interval: Optional[int] = None,
+        bands: Optional[List[str]] = None
     ) -> dict[str, List[Path]]:
         """Fetch all high-quality images for all monuments within a date range.
 
@@ -401,23 +634,206 @@ class MonumentImageManager:
             Minimum number of days between downloaded images. If None, all images
             are downloaded. If specified, only images that are at least 'interval'
             days apart from the previous downloaded image will be included.
+        bands:
+            List of band names to extract in the specified order.
+            Default is ['B02', 'B03', 'B04', 'B08', 'B11', 'B12'] corresponding to
+            (Blue, Green, Red, NIR, SWIR1, SWIR2).
+            Extracts specified bands and saves as GeoTIFF. Only applicable when asset_type is PRODUCT.
 
         Returns
         -------
         dict[str, List[Path]]:
             Dictionary mapping monument names to lists of stored image paths.
+
+        Notes
+        -----
+        Available Sentinel-2 bands:
+        - B02 (Blue), B03 (Green), B04 (Red), B08 (NIR) at 10m resolution
+        - B11 (SWIR1), B12 (SWIR2) at 20m resolution
+        When mixing resolutions, lower resolution bands are upsampled to match the highest resolution.
         """
+        # Set default bands if not specified
+        if bands is None:
+            bands = ['B02', 'B03', 'B04', 'B08', 'B11', 'B12']
+
         results: dict[str, List[Path]] = {}
 
         for monument in self.monuments:
             paths = self.collect_time_series_for_monument(
-                monument, start_date, end_date, interval
+                monument, start_date, end_date, interval, bands
             )
             results[monument.name] = paths
 
         total_images = sum(len(paths) for paths in results.values())
         logger.info(
             f"Collected {total_images} total images across {len(self.monuments)} monuments"
+        )
+
+        return results
+
+    def download_safe_archives_for_monument(
+        self,
+        monument: Monument,
+        start_date: dt.date | dt.datetime,
+        end_date: dt.date | dt.datetime,
+        interval: Optional[int] = None,
+        archives_dir: Optional[Path] = None
+    ) -> List[Path]:
+        """Download full SAFE archives for a monument within a date range.
+
+        This downloads complete SAFE zip files without extracting or processing them.
+        Useful when you need access to all bands and metadata, or want to process
+        the data later with custom tools.
+
+        Parameters
+        ----------
+        monument:
+            Monument to fetch archives for.
+        start_date:
+            Start date of the period (inclusive).
+        end_date:
+            End date of the period (inclusive).
+        interval:
+            Minimum number of days between downloaded archives. If None, all archives
+            are downloaded.
+        archives_dir:
+            Directory where SAFE archives should be stored. If None, uses
+            storage_root/archives/{monument_name}/
+
+        Returns
+        -------
+        List[Path]:
+            List of paths to downloaded SAFE archive zip files.
+        """
+        logger.info(
+            f"Downloading SAFE archives for '{monument.name}' "
+            f"from {start_date} to {end_date}"
+        )
+
+        # Setup archives directory
+        if archives_dir is None:
+            archives_dir = self.storage_root / "archives" / monument.name
+        archives_dir.mkdir(parents=True, exist_ok=True)
+
+        # Also create metadata directory
+        metadata_dir = archives_dir / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+
+        stored_paths: List[Path] = []
+        last_downloaded_date: Optional[dt.datetime] = None
+
+        try:
+            # Use generator to stream downloads one at a time
+            search_order = getattr(self, '_search_order', 'asc')
+            image_generator = fetch_all_images_in_period(
+                monument.bbox,
+                start_date=start_date,
+                end_date=end_date,
+                max_cloud_cover=self.max_cloud_cover,
+                collection=self.collection,
+                asset_type="PRODUCT",  # Always use PRODUCT for full archives
+                token_path=self.token_path,
+                order=search_order,
+            )
+
+            for item in image_generator:
+                try:
+                    # Build output path from metadata
+                    from .collection import GeospatialCollection
+                    collection = GeospatialCollection(self.storage_root, monument.name)
+                    base = collection._build_base_filename(item["metadata"])
+                    archive_path = archives_dir / f"{base}.zip"
+                    metadata_path = metadata_dir / f"{base}.json"
+
+                    # Parse image timestamp
+                    image_date = self._parse_image_timestamp(item["metadata"])
+
+                    # Skip if already downloaded
+                    if metadata_path.exists():
+                        logger.info(f"  Skipping {item['index']}/{item['total']}: already exists")
+                        stored_paths.append(archive_path)
+                        last_downloaded_date = image_date if image_date else last_downloaded_date
+                        continue
+
+                    # Apply interval filter if specified
+                    if self._should_skip_by_interval(
+                        image_date, last_downloaded_date, interval, item
+                    ):
+                        continue
+
+                    # Download archive
+                    token = _read_token(item["token_path"])
+                    logger.info(
+                        f"  Downloading {item['index']}/{item['total']}: "
+                        f"{item['metadata']['timestamp']} ({archive_path.name})"
+                    )
+
+                    # Download directly to archive path (no processing)
+                    _download_asset_to_file(item["href"], token, archive_path)
+
+                    # Save metadata
+                    self._save_metadata(metadata_path, item["metadata"])
+
+                    stored_paths.append(archive_path)
+                    last_downloaded_date = image_date
+
+                except Exception as e:
+                    logger.warning(
+                        f"  Failed to download archive {item['index']}: {e}"
+                    )
+                    continue
+
+            logger.info(
+                f"Successfully downloaded {len(stored_paths)} SAFE archives for '{monument.name}'"
+            )
+            return stored_paths
+
+        except CopernicusAPIError as e:
+            logger.warning(f"Failed to fetch archives for '{monument.name}': {e}")
+            return []
+
+    def download_safe_archives_for_all_monuments(
+        self,
+        start_date: dt.date | dt.datetime,
+        end_date: dt.date | dt.datetime,
+        interval: Optional[int] = None,
+        archives_dir: Optional[Path] = None
+    ) -> dict[str, List[Path]]:
+        """Download full SAFE archives for all monuments within a date range.
+
+        Parameters
+        ----------
+        start_date:
+            Start date of the period (inclusive).
+        end_date:
+            End date of the period (inclusive).
+        interval:
+            Minimum number of days between downloaded archives. If None, all archives
+            are downloaded.
+        archives_dir:
+            Base directory where SAFE archives should be stored. If None, uses
+            storage_root/archives/. Each monument gets its own subdirectory.
+
+        Returns
+        -------
+        dict[str, List[Path]]:
+            Dictionary mapping monument names to lists of archive paths.
+        """
+        results: dict[str, List[Path]] = {}
+
+        for monument in self.monuments:
+            monument_archives_dir = None
+            if archives_dir is not None:
+                monument_archives_dir = Path(archives_dir) / monument.name
+
+            paths = self.download_safe_archives_for_monument(
+                monument, start_date, end_date, interval, monument_archives_dir
+            )
+            results[monument.name] = paths
+
+        total_archives = sum(len(paths) for paths in results.values())
+        logger.info(
+            f"Downloaded {total_archives} total SAFE archives across {len(self.monuments)} monuments"
         )
 
         return results
